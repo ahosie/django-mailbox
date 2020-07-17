@@ -242,16 +242,23 @@ class Mailbox(models.Model):
         msg.save()
         return msg
 
-    def _get_dehydrated_message(self, msg, record):
+    def _get_dehydrated_message(self, msg, record, ids_of_messages_with_eml_attachments_with_attached_non_emls=[]):
         settings = utils.get_settings()
 
         new = EmailMessage()
-        if msg.is_multipart():
+        if (
+            msg.is_multipart()
+            and not 'attachment' in msg.get('Content-Disposition', '')
+        ):
             for header, value in msg.items():
                 new[header] = value
             for part in msg.get_payload():
                 new.attach(
-                    self._get_dehydrated_message(part, record)
+                    self._get_dehydrated_message(
+                        part,
+                        record,
+                        ids_of_messages_with_eml_attachments_with_attached_non_emls=ids_of_messages_with_eml_attachments_with_attached_non_emls
+                    )
                 )
         elif (
             settings['strip_unallowed_mimetypes']
@@ -287,11 +294,52 @@ class Mailbox(models.Model):
 
             attachment = MessageAttachment()
 
+            if msg.get_content_type() == 'message/rfc822':
+                attachment_payloads = msg.get_payload()
+                if len(attachment_payloads) != 1:
+                    raise AssertionError(
+                        "Attachment of type 'message/rfc822' "
+                        'must have exactly 1 payload.'
+                    )
+                if six.PY3:
+                    attachment_payload = attachment_payloads[0].as_bytes()
+                else:
+                    attachment_payload = attachment_payloads[0].as_string()
+            elif record.id == 2963 and msg.get_content_type() =='message/delivery-status':
+                from base64 import b64decode
+
+                attachment_payload = b64decode(msg.get_payload(1)._payload)
+            else:
+                attachment_payload = msg.get_payload(decode=True)
+
+            # Do not duplicate already existing non-eml attachments that were attached to .eml attachments
+            # Compare encoded names and lengths
+            # TODO remove when not needed
+            if (
+                attachment_payload is not None
+                and record.id in ids_of_messages_with_eml_attachments_with_attached_non_emls
+            ):
+                import re
+
+                existing_attachments = []
+                for a in record.attachments.all():
+                    match = re.search(r'filename="(.+)"', a.headers)
+                    filename = match.groups()[0] if match else None
+                    existing_attachments.append((filename, a.document.file.size))
+
+                content_disposition = [h for h in msg._headers if h[0] == 'Content-Disposition'][0][1]
+                match = re.search(r'filename="(.+)"', content_disposition)
+                filename = match.groups()[0] if match else None
+                new_attachment = (filename, len(attachment_payload))
+
+                if new_attachment in existing_attachments:
+                    return EmailMessage()  # do not save, return a placeholder
+
             attachment.document.save(
                 uuid.uuid4().hex + extension,
                 ContentFile(
-                    BytesIO(
-                        msg.get_payload(decode=True)
+                      BytesIO(
+                        attachment_payload
                     ).getvalue()
                 )
             )
@@ -363,6 +411,21 @@ class Mailbox(models.Model):
             )
         msg.save()
         message = self._get_dehydrated_message(message, msg)
+
+        # Monkey-patch email.message.replace_header to handle the
+        # "missing header" case, especially Content-Transfer-Encoding.
+        # This fixes message.as_string()
+        try:
+            EmailMessage.original_replace_header
+        except AttributeError:
+            EmailMessage.original_replace_header = EmailMessage.replace_header
+            def replace_header(self, _name, _value):
+                try:
+                    self.original_replace_header(_name, _value)
+                except KeyError:
+                    self._headers.append((_name, _value))
+            EmailMessage.replace_header = replace_header
+
         try:
             body = message.as_string()
         except KeyError as exc:
@@ -767,6 +830,11 @@ class MessageAttachment(models.Model):
         return email.message_from_string(headers)
 
     def _set_dehydrated_headers(self, email_object):
+        if email_object._payload is None:
+            # otherwise it breaks in
+            # lib/python3.x/email/generator.py:_handle_message,
+            # line: "self._fp.write(payload)"
+            email_object._payload = ""
         self.headers = email_object.as_string()
 
     def __delitem__(self, name):
